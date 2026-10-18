@@ -28,6 +28,7 @@ struct Config {
 fn authority_rights(key: u16) -> Rights {
     match key {
         3 => Rights::CREATE_PROCESS
+            .union(Rights::RETAIN_PROCESS)
             .union(Rights::CREATE_TASK_GROUP)
             .union(Rights::LOCK_MEMORY)
             .union(Rights::DUPLICATE),

@@ -15,6 +15,9 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+test-service-failure = []
+
 [dependencies]
 hyper-component.workspace = true
 hyper-component-config.workspace = true

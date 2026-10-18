@@ -36,6 +36,36 @@ impl Manager {
         };
         self.running[index].group = Some(group);
         let mut grants = Vec::new();
+        #[cfg(feature = "test-service-failure")]
+        let mut failure_observer = None;
+        #[cfg(feature = "test-service-failure")]
+        if program.image == "/bin/service-probe"
+            && program.arguments.first().is_some_and(|mode| {
+                matches!(
+                    mode.as_str(),
+                    "stop-component" | "stop-component-then-report"
+                )
+            })
+        {
+            // The probe waits for a genuine Process termination. Supervision
+            // remains linear in the manager; only a wait observer is exported.
+            let target = program
+                .arguments
+                .get(1)
+                .and_then(|path| self.lifecycle.topology.index(path))
+                .ok_or(Error::InvalidResponse)?;
+            let process = self.running[target]
+                .process
+                .as_ref()
+                .ok_or(Error::MissingHandle)?;
+            let (sender, receiver) = CapabilityChannel::create()?;
+            failure_observer = Some((sender, Some(process.as_process_supervisor().observe()?)));
+            grants.push((
+                0x80ff_0011,
+                Rights::READ.union(Rights::WAIT),
+                Object::CapabilityChannel(Some(receiver.into_handle())),
+            ));
+        }
         if !program.prepared {
             for route in self
                 .lifecycle
@@ -69,6 +99,7 @@ impl Manager {
             .name("component-start".into())
             .spawn(move || {
                 let mut outgoing = None;
+                let mut retirement = None;
                 let mut phase = "prepare";
                 let process = (|| {
                     let builder = match prepared {
@@ -124,22 +155,41 @@ impl Manager {
                         wake.clone(),
                         canceled.clone(),
                     )?);
+                    phase = "retain diagnostics";
+                    retirement = Some(builder.retain_on_exit(8 * 1024 * 1024, 10_000_000_000)?);
                     phase = "seal";
                     builder.seal()?;
                     if canceled.load(std::sync::atomic::Ordering::Acquire) {
                         return Err(Error::Status(hyper_os::Status::BAD_STATE));
                     }
                     phase = "start";
-                    builder.start().map_err(|f| match f {
+                    let process = builder.start().map_err(|f| match f {
                         StartFailure::Rejected { error, .. } | StartFailure::Committed(error) => {
                             error
                         }
-                    })
+                    })?;
+                    #[cfg(feature = "test-service-failure")]
+                    if let Some((sender, observer)) = &mut failure_observer {
+                        use hyper_os::capability_channel::CapabilityDisposition;
+                        // Process observers deliberately cannot be retained in
+                        // a ProcessBuilder. Transfer after the child is running.
+                        let mut offers = [CapabilityDisposition::move_handle(
+                            observer,
+                            RightsOffer::Exact(Rights::WAIT),
+                        )?];
+                        hyper_service_ipc::send(
+                            sender,
+                            hyper_service_ipc::deadline()?,
+                            b"observer",
+                            &mut offers,
+                        )?;
+                    }
+                    Ok(process)
                 })();
-                if let Err(error) = &process
-                    && let Some(log) = &log
-                {
-                    let _ = record_failure(log, &name, generation, phase, error);
+                if process.is_err() {
+                    // A committed start failure may leave no supervisor handle;
+                    // dropping the separate control preauthorizes cleanup.
+                    retirement.take();
                 }
                 emit(
                     &send,
@@ -148,12 +198,46 @@ impl Manager {
                         index,
                         generation,
                         process,
+                        retirement,
                         outgoing,
+                        phase,
                     },
                 );
             })
             .map_err(|_| Error::Status(hyper_os::Status::NO_MEMORY))?;
         self.running[index].construction = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-service-failure")]
+    pub(super) fn inject_failure(&self, index: usize) -> Result<()> {
+        let program = self.lifecycle.topology.instances[index]
+            .declaration
+            .program
+            .as_ref()
+            .ok_or(Error::InvalidResponse)?;
+        if program.image == "/bin/service-probe"
+            && program.arguments.first().is_some_and(|mode| {
+                matches!(
+                    mode.as_str(),
+                    "stop-component" | "stop-component-then-report"
+                )
+            })
+        {
+            let target = program
+                .arguments
+                .get(1)
+                .and_then(|path| self.lifecycle.topology.index(path))
+                .ok_or(Error::InvalidResponse)?;
+            let process = self.running[target]
+                .process
+                .as_ref()
+                .ok_or(Error::MissingHandle)?;
+            // Inject after the probe has started, so killing journal cannot
+            // prevent the probe's own stdio registration. This deliberately
+            // bypasses lifecycle.stop() to model an unexpected process death.
+            process.as_process_supervisor().request_stop()?;
+        }
         Ok(())
     }
 
@@ -460,26 +544,4 @@ fn attach_stdio(
             .map_err(|f| f.error())?;
     }
     Ok(())
-}
-
-fn record_failure(
-    log: &OwnedHandle<CapabilityChannelObject>,
-    name: &str,
-    generation: u64,
-    phase: &str,
-    error: &Error,
-) -> Result<()> {
-    let (writer, reader) = hyper_os::channel::create_pair()?;
-    hyper_journal::register(
-        log.as_handle_ref(),
-        &hyper_journal::Source {
-            component: name.into(),
-            generation,
-            stream: hyper_journal::Stream::Log,
-        },
-        reader,
-    )?;
-    writer
-        .as_byte_channel()
-        .try_send(format!("process launch failed during {phase}: {error:?}\n").as_bytes())
 }

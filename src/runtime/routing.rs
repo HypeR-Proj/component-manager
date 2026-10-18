@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use connection::{Rejection, RejectionKind};
 use hyper_component_config::CapabilityType;
 use hyper_os::capability_channel::CapabilityDisposition;
 
@@ -20,7 +21,10 @@ impl Manager {
     pub(super) fn connection(&mut self, index: usize, generation: u64, call: connection::Call) {
         let result = (|| {
             if !self.lifecycle.is_current(index, generation) {
-                return Err("caller execution is no longer active".into());
+                return Err(Rejection::new(
+                    RejectionKind::Unavailable,
+                    "caller execution is no longer active",
+                ));
             }
             match &call.request {
                 connection::Request::Publish { name } => {
@@ -29,8 +33,14 @@ impl Manager {
                 connection::Request::Status { message } => {
                     self.lifecycle.detail(index, generation, message)
                 }
+                connection::Request::ReportFailure { message } => {
+                    self.lifecycle.detail(index, generation, message).map(|()| {
+                        self.report(index, &format!("worker failure: {message}"), true);
+                    })
+                }
                 connection::Request::Connect { .. } => return Ok(false),
-            }?;
+            }
+            .map_err(|message| Rejection::new(RejectionKind::InvalidRequest, message))?;
             Ok(true)
         })();
         match result {
@@ -49,21 +59,45 @@ impl Manager {
                 .lifecycle
                 .topology
                 .route(index, name)
-                .ok_or("capability is not offered to this component")?
+                .ok_or_else(|| {
+                    Rejection::new(
+                        RejectionKind::NotOffered,
+                        "capability is not offered to this component",
+                    )
+                })?
                 .clone();
             if !matches!(route.kind, CapabilityType::Protocol { .. }) {
-                return Err("requested capability is not a protocol".to_owned());
+                return Err(Rejection::new(
+                    RejectionKind::InvalidRequest,
+                    "requested capability is not a protocol",
+                ));
             }
             if self.pending.len() >= MAX_PENDING
                 || self.pending.iter().filter(|p| p.consumer == index).count() >= 8
             {
-                return Err("connection queue is full".into());
+                return Err(Rejection::new(
+                    RejectionKind::ResourceLimit,
+                    "connection queue is full",
+                ));
             }
-            let time = now().map_err(|e| format!("clock: {e:?}"))?;
+            let time = now()
+                .map_err(|e| Rejection::new(RejectionKind::Unavailable, format!("clock: {e:?}")))?;
             if *deadline_ns <= time {
-                return Err("connection deadline exceeded".into());
+                return Err(Rejection::new(
+                    RejectionKind::TimedOut,
+                    "connection deadline exceeded",
+                ));
             }
-            let epoch = self.lifecycle.demand(route.provider)?;
+            if self.lifecycle.status(route.provider).state == State::RestartWait {
+                return Err(Rejection::new(
+                    RejectionKind::Restarting,
+                    "restart backoff is active",
+                ));
+            }
+            let epoch = self
+                .lifecycle
+                .demand(route.provider)
+                .map_err(|message| Rejection::new(RejectionKind::Unavailable, message))?;
             Ok((
                 route,
                 epoch,
@@ -92,12 +126,23 @@ impl Manager {
             let pending = &mut self.pending[index];
             let status = self.lifecycle.status(pending.provider);
             let error = if time >= pending.until {
-                Some("provider connection deadline exceeded")
+                Some(Rejection::new(
+                    RejectionKind::TimedOut,
+                    "provider connection deadline exceeded",
+                ))
             } else if !self
                 .lifecycle
                 .is_current(pending.consumer, pending.consumer_generation)
             {
-                Some("caller execution ended")
+                Some(Rejection::new(
+                    RejectionKind::Unavailable,
+                    "caller execution ended",
+                ))
+            } else if status.state == State::RestartWait {
+                Some(Rejection::new(
+                    RejectionKind::Restarting,
+                    "provider is restarting",
+                ))
             } else if status.generation > pending.provider_generation
                 || matches!(
                     status.state,
@@ -106,12 +151,15 @@ impl Manager {
                 || (status.generation == pending.provider_generation
                     && status.state == State::Stopped)
             {
-                Some("provider execution unavailable")
+                Some(Rejection::new(
+                    RejectionKind::Unavailable,
+                    "provider execution unavailable",
+                ))
             } else {
                 None
             };
             let result = if let Some(error) = error {
-                Some(Err(error.to_owned()))
+                Some(Err(error))
             } else if status.state == State::Running
                 && status.generation == pending.provider_generation
                 && status.published.contains(&pending.capability)
@@ -128,10 +176,16 @@ impl Manager {
                     match outgoing.try_send(&bytes, &mut [offer]) {
                         Ok(()) => Some(Ok(())),
                         Err(Error::Status(hyper_os::Status::WOULD_BLOCK)) => None,
-                        Err(e) => Some(Err(format!("provider endpoint: {e:?}"))),
+                        Err(e) => Some(Err(Rejection::new(
+                            RejectionKind::Unavailable,
+                            format!("provider endpoint: {e:?}"),
+                        ))),
                     }
                 } else {
-                    Some(Err("provider endpoint unavailable".into()))
+                    Some(Err(Rejection::new(
+                        RejectionKind::Unavailable,
+                        "provider endpoint unavailable",
+                    )))
                 }
             } else {
                 None

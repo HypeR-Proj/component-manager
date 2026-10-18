@@ -29,7 +29,9 @@ pub(super) enum Event {
         index: usize,
         generation: u64,
         process: Result<OwnedHandle<ProcessObject>>,
+        retirement: Option<hyper_os::task::ProcessRetirement>,
         outgoing: Option<CapabilityChannel>,
+        phase: &'static str,
     },
     Command {
         request: hyper_component::Request,
@@ -40,11 +42,13 @@ pub(super) enum Event {
 #[derive(Default)]
 pub(super) struct Running {
     process: Option<OwnedHandle<ProcessObject>>,
+    retirement: Option<hyper_os::task::ProcessRetirement>,
     group: Option<OwnedHandle<TaskGroupObject>>,
     construction: bool,
     canceled: Arc<std::sync::atomic::AtomicBool>,
     outgoing: Option<CapabilityChannel>,
     install_reply: Option<(CapabilityChannel, u64)>,
+    termination_reported: bool,
 }
 
 pub struct Authority {
@@ -78,6 +82,7 @@ pub struct Manager {
     snapshot: Arc<Mutex<Snapshot>>,
     replies: mpsc::SyncSender<InstallationReply>,
     diagnostic: Option<OwnedHandle<ByteChannelObject>>,
+    diagnostics: crate::diagnostics::Diagnostics,
     log_connector: Option<Arc<OwnedHandle<CapabilityChannelObject>>>,
     management_clients: Option<(
         OwnedHandle<CapabilityChannelObject>,
@@ -105,6 +110,7 @@ impl Manager {
             startup_logs: Vec::new(),
             replies,
             diagnostic: None,
+            diagnostics: crate::diagnostics::Diagnostics::default(),
             log_connector: None,
             lifecycle,
             authority: Arc::new(authority),
@@ -161,6 +167,7 @@ impl Manager {
                 .collect();
             for (index, generation) in self.lifecycle.begin_ready(now()?, |i| ready[i]) {
                 if let Err(e) = self.launch(index, generation) {
+                    self.report(index, &format!("launch failed: {e:?}"), true);
                     self.lifecycle
                         .fail(index, generation, &format!("launch: {e:?}"), now()?);
                     // observe() joins the construction group before releasing
@@ -168,6 +175,7 @@ impl Manager {
                 }
             }
             self.dispatch()?;
+            self.flush_diagnostics();
             self.update_display();
             *self.snapshot.lock().map_err(|_| Error::InvalidResponse)? =
                 self.lifecycle.snapshot(now()?);
@@ -191,7 +199,9 @@ impl Manager {
                 index,
                 generation,
                 process,
+                retirement,
                 outgoing,
+                phase,
             } => {
                 self.running[index].outgoing = outgoing;
                 let current = self.lifecycle.status(index).generation == generation;
@@ -199,6 +209,7 @@ impl Manager {
                     return Err(Error::InvalidResponse);
                 }
                 self.running[index].construction = false;
+                self.running[index].retirement = retirement;
                 match process {
                     Ok(process) => {
                         let koid = process.basic_info()?.koid.get();
@@ -217,8 +228,15 @@ impl Manager {
                             );
                         }
                         self.running[index].process = Some(process);
+                        #[cfg(feature = "test-service-failure")]
+                        self.inject_failure(index)?;
                     }
                     Err(error) => {
+                        self.report(
+                            index,
+                            &format!("process start failed during {phase}: {error:?}"),
+                            true,
+                        );
                         self.lifecycle.fail(
                             index,
                             generation,
@@ -243,24 +261,58 @@ impl Manager {
         for i in 0..self.running.len() {
             let generation = self.lifecycle.status(i).generation;
             if self.lifecycle.startup_expired(i, now()?) {
+                self.report(i, "startup deadline exceeded", true);
                 self.lifecycle
                     .fail(i, generation, "startup deadline exceeded", now()?);
             }
-            let instance = &mut self.running[i];
-            let info = instance
+            let info = self.running[i]
                 .process
                 .as_ref()
                 .map(|p| p.as_process_supervisor().info())
                 .transpose()?;
-            let terminal = info.as_ref().is_some_and(|p| {
-                matches!(
-                    p.phase,
-                    ProcessPhase::Stopped | ProcessPhase::Retiring | ProcessPhase::Retired
-                )
-            });
-            if terminal {
+            let terminal = info.as_ref().is_some_and(|p| p.terminal.is_some());
+            // Termination has begun, but teardown may still be blocked in a
+            // failed provider. Report now, while retaining every resource owner.
+            if terminal && !self.running[i].termination_reported {
+                let message = match info.as_ref().and_then(|p| p.terminal.as_ref()) {
+                    Some(reason) => format!("terminated: {reason:?}"),
+                    None => "terminated: reason unavailable".into(),
+                };
+                self.report(i, &message, !info.as_ref().is_some_and(process_succeeded));
+                self.running[i].termination_reported = true;
                 self.lifecycle.exiting(i, generation);
+                self.lifecycle.exit_detail(i, generation, &message);
             }
+            if terminal && let Some(retirement) = self.running[i].retirement.as_ref() {
+                let observed = retirement.info().and_then(|retained| {
+                    if retained.ready() || retained.released() {
+                        retirement.release().map(|()| Some(retained))
+                    } else {
+                        Ok(None)
+                    }
+                });
+                match observed {
+                    Ok(Some(retained)) => {
+                        self.running[i].retirement.take();
+                        if !info.as_ref().is_some_and(process_succeeded) {
+                            self.report(i, &format!(
+                                "postmortem: fault={} pc=0x{:x} address=0x{:x} retained={} bytes",
+                                retained.fault_class, retained.fault_pc,
+                                retained.fault_address, retained.retained_bytes,
+                            ), true);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Losing diagnostics must not terminate the manager or
+                        // hold a failed process forever. Dropping its unique
+                        // control is the kernel's cleanup fallback.
+                        self.running[i].retirement.take();
+                        self.report(i, &format!("postmortem unavailable: {error:?}"), true);
+                    }
+                }
+            }
+            let instance = &mut self.running[i];
             let state = self.lifecycle.status(i).state;
             if state == State::Stopping || terminal {
                 instance
@@ -294,27 +346,7 @@ impl Manager {
                     Err(error) => return Err(error),
                 }
             }
-            if let Some(termination) = info.as_ref().and_then(|p| p.terminal.as_ref()) {
-                let message = format!("{termination:?}");
-                if let Some(log) = &self.diagnostic {
-                    let text = format!(
-                        "{} generation={generation} retired: {message}\n",
-                        self.lifecycle.status(i).path
-                    );
-                    let _ = log.as_byte_channel().try_send(text.as_bytes());
-                }
-                self.lifecycle.exit_detail(i, generation, &message);
-            }
-            let success = info.is_some_and(|p| {
-                matches!(
-                    p.terminal,
-                    Some(
-                        hyper_os::task::ProcessTermination::ProcessExited { status: 0 }
-                            | hyper_os::task::ProcessTermination::LastThreadExited { status: 0 }
-                            | hyper_os::task::ProcessTermination::ThreadExited { status: 0 }
-                    )
-                )
-            });
+            let success = info.as_ref().is_some_and(process_succeeded);
             self.lifecycle
                 .retired(i, generation, success, now()?)
                 .map_err(|_| Error::InvalidResponse)?;
@@ -345,13 +377,54 @@ impl Manager {
             }
         }
         let until = hyper_os::time::deadline_after(std::time::Duration::from_millis(
-            if self.pending.is_empty() { 100 } else { 10 },
+            if self.pending.is_empty() && !self.diagnostics.pending() {
+                100
+            } else {
+                10
+            },
         ))?
         .as_raw();
         match wait_many(&items, until) {
             Ok(_) | Err(Error::Status(hyper_os::Status::TIMED_OUT)) => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn report(&mut self, index: usize, message: &str, failure: bool) {
+        let status = self.lifecycle.status(index);
+        let critical = self.lifecycle.topology.instances[index]
+            .declaration
+            .program
+            .as_ref()
+            .is_some_and(|p| p.critical);
+        let severity = if critical {
+            "CRITICAL"
+        } else if failure {
+            "ERROR"
+        } else {
+            "NOTICE"
+        };
+        self.diagnostics.push(
+            format!(
+                "{severity}: {} generation={} {message}; process=0x{:x}",
+                status.path,
+                status.generation,
+                status.process.unwrap_or(0),
+            ),
+            critical,
+        );
+    }
+
+    fn flush_diagnostics(&mut self) {
+        let console = hyper_rt::process::console();
+        self.diagnostics.flush(
+            |bytes| {
+                self.diagnostic
+                    .as_ref()
+                    .is_some_and(|log| log.as_byte_channel().try_send(bytes).is_ok())
+            },
+            |bytes| console.as_ref().ok()?.as_console().try_write(bytes).ok(),
+        );
     }
 }
 
@@ -404,4 +477,16 @@ impl Manager {
             result,
         });
     }
+}
+
+fn process_succeeded(info: &hyper_os::task::ProcessInfo) -> bool {
+    use hyper_os::task::ProcessTermination;
+    matches!(
+        info.terminal,
+        Some(
+            ProcessTermination::ProcessExited { status: 0 }
+                | ProcessTermination::LastThreadExited { status: 0 }
+                | ProcessTermination::ThreadExited { status: 0 }
+        )
+    )
 }
