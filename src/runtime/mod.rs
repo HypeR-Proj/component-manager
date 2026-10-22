@@ -278,7 +278,13 @@ impl Manager {
                     Some(reason) => format!("terminated: {reason:?}"),
                     None => "terminated: reason unavailable".into(),
                 };
-                self.report(i, &message, !info.as_ref().is_some_and(process_succeeded));
+                let success = info.as_ref().is_some_and(process_succeeded);
+                let report = if success && !self.critical(i) {
+                    "exited successfully (status 0); releasing resources"
+                } else {
+                    &message
+                };
+                self.report(i, report, !success);
                 self.running[i].termination_reported = true;
                 self.lifecycle.exiting(i, generation);
                 self.lifecycle.exit_detail(i, generation, &message);
@@ -390,19 +396,23 @@ impl Manager {
         }
     }
 
-    fn report(&mut self, index: usize, message: &str, failure: bool) {
-        let status = self.lifecycle.status(index);
-        let critical = self.lifecycle.topology.instances[index]
+    fn critical(&self, index: usize) -> bool {
+        self.lifecycle.topology.instances[index]
             .declaration
             .program
             .as_ref()
-            .is_some_and(|p| p.critical);
+            .is_some_and(|p| p.critical)
+    }
+
+    fn report(&mut self, index: usize, message: &str, failure: bool) {
+        let status = self.lifecycle.status(index);
+        let critical = self.critical(index);
         let severity = if critical {
             "CRITICAL"
         } else if failure {
             "ERROR"
         } else {
-            "NOTICE"
+            "INFO"
         };
         self.diagnostics.push(
             format!(

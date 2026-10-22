@@ -16,8 +16,8 @@ const RESET: &str = "\x1b[0m";
 struct Observation {
     generation: u64,
     state: State,
-    since: u64,
-    elapsed: u64,
+    started: Option<u64>,
+    elapsed: Option<u64>,
     detail: String,
 }
 
@@ -38,7 +38,7 @@ impl Renderer {
                 .map(|instance| {
                     (
                         instance.path.clone(),
-                        clean(&instance.declaration.description, 30),
+                        clean(&instance.declaration.description, 26),
                     )
                 })
                 .collect(),
@@ -63,58 +63,49 @@ impl Renderer {
                 continue;
             }
             let changed = self.seen.get(&status.path).is_none_or(|seen| {
-                seen.generation != status.generation
-                    || seen.state != status.state
-                    || seen.detail != status.detail
+                seen.generation != status.generation || seen.state != status.state
             });
-            if !changed {
-                continue;
-            }
+            let diagnostic_changed = self.seen.get(&status.path).is_none_or(|seen| {
+                seen.generation != status.generation || seen.detail != status.detail
+            });
             let seen = self.seen.entry(status.path.clone()).or_insert(Observation {
                 generation: status.generation,
                 state: status.state,
-                since: now,
-                elapsed: 0,
+                started: None,
+                elapsed: None,
                 detail: String::new(),
             });
             if seen.generation != status.generation {
                 seen.generation = status.generation;
-                seen.since = now;
-                seen.elapsed = 0;
+                seen.started = None;
+                seen.elapsed = None;
             }
-            if matches!(
-                status.state,
-                State::Starting | State::Completed | State::Failed
-            ) || seen.state == State::Starting
-            {
-                seen.elapsed = now.saturating_sub(seen.since);
+            if changed {
+                if status.state == State::Starting {
+                    seen.started = Some(now);
+                    seen.elapsed = None;
+                } else {
+                    seen.elapsed = seen.started.map(|start| now.saturating_sub(start));
+                }
             }
             seen.state = status.state;
             seen.detail.clone_from(&status.detail);
-            let (color, label) = match status.state {
-                State::Starting => ("33", "START  "),
-                State::Running => ("32", "RUNNING"),
-                State::Completed => ("32", "DONE   "),
-                State::Failed => ("31", "FAILED "),
-                State::Stopping => ("33", "STOP   "),
-                State::RestartWait => ("33", "RETRY  "),
-                State::Stopped => ("2", "STOPPED"),
-            };
-            let role = self
-                .descriptions
-                .get(&status.path)
-                .map_or("", String::as_str);
-            let _ = write!(
-                output,
-                "  \x1b[{color}m[{label}]{RESET} {:<23} {role:<30} {DIM}{:>8.2} ms{RESET}\r\n",
-                clean(&status.path, 23),
-                seen.elapsed as f64 / 1_000_000.0,
-            );
-            if matches!(status.state, State::Failed | State::RestartWait) {
+            // Exit reasons are reported immediately by lifecycle diagnostics.
+            // Resource teardown is not another startup result: show DONE,
+            // FAILED or STOPPED only after retirement, while retaining the real
+            // Stopping state for the summary and componentctl.
+            if changed {
+                Self::status_line(&mut output, status, seen, &self.descriptions);
+            }
+            if matches!(status.state, State::Failed | State::RestartWait)
+                && (changed || diagnostic_changed)
+                && !status.detail.is_empty()
+            {
                 let _ = write!(
                     output,
-                    "      \x1b[31m! {}{RESET}\r\n",
-                    clean(&status.detail, 66)
+                    "      \x1b[31m! {}: {}{RESET}\r\n",
+                    clean(&status.path, 24),
+                    clean(&status.detail, 44),
                 );
             }
         }
@@ -133,6 +124,66 @@ impl Renderer {
         output
     }
 
+    fn status_line(
+        output: &mut String,
+        status: &hyper_component::ComponentStatus,
+        seen: &Observation,
+        descriptions: &BTreeMap<String, String>,
+    ) {
+        let (color, label) = match status.state {
+            State::Starting => ("33", "START  "),
+            State::Running => ("32", "RUNNING"),
+            State::Completed => ("32", "DONE   "),
+            State::Failed => ("31", "FAILED "),
+            State::Stopping => return,
+            State::RestartWait => ("33", "RETRY  "),
+            State::Stopped => ("2", "STOPPED"),
+        };
+        let role = descriptions.get(&status.path).map_or("", String::as_str);
+        let duration = if status.state == State::Starting {
+            String::new()
+        } else if let Some(elapsed) = seen.elapsed {
+            let kind = if status.state == State::Running {
+                "start"
+            } else {
+                "total"
+            };
+            format!("{kind} {:.2} ms", elapsed as f64 / 1_000_000.0)
+        } else {
+            "time unknown".into()
+        };
+        // Identity must remain distinguishable even for nested components with
+        // a common prefix. Long paths get their own wrapped row, not ellipses.
+        let path = clean(&status.path, status.path.len());
+        if path.len() > 20 {
+            let _ = write!(output, "  \x1b[{color}m[{label}]{RESET} ");
+            for (index, chunk) in path.as_bytes().chunks(66).enumerate() {
+                if index != 0 {
+                    output.push_str("            ");
+                }
+                let _ = write!(output, "{}\r\n", String::from_utf8_lossy(chunk));
+            }
+            if !role.is_empty() || !duration.is_empty() {
+                let _ = write!(
+                    output,
+                    "                                 {role:<26} {DIM}{duration:>18}{RESET}\r\n"
+                );
+            }
+        } else {
+            let _ = write!(
+                output,
+                "  \x1b[{color}m[{label}]{RESET} {path:<20} {role:<26} {DIM}{duration:>18}{RESET}\r\n",
+            );
+        }
+        if status.generation > 1 {
+            let _ = write!(
+                output,
+                "      {DIM}generation {} / restarts {}{RESET}\r\n",
+                status.generation, status.restarts,
+            );
+        }
+    }
+
     pub(super) fn finish(&mut self, now: u64, success: bool) -> String {
         let mut output = String::new();
         let count = |state| {
@@ -143,17 +194,35 @@ impl Renderer {
         };
         let _ = write!(
             output,
-            "  {} running, {} finished, {} failed / elapsed {:.3}s\r\n",
+            "  {} running, {} completed, {} failed / startup {:.3}s\r\n",
             count(State::Running),
             count(State::Completed),
             count(State::Failed),
             seconds(now.saturating_sub(self.began)),
         );
+        let mut pending = false;
+        for (state, label) in [
+            (State::Starting, "starting"),
+            (State::Stopping, "cleaning up"),
+            (State::RestartWait, "waiting to retry"),
+            (State::Stopped, "stopped"),
+        ] {
+            let n = count(state);
+            if n != 0 {
+                pending = true;
+                let _ = write!(output, "  {n} {label}\r\n");
+            }
+        }
         output.push_str(if success {
             "HypeR: startup complete\r\n\r\n"
         } else {
-            "HypeR: startup incomplete; continuing with available services\r\n\r\n"
+            "HypeR: startup incomplete\r\n\r\n"
         });
+        if !success || pending || count(State::Failed) != 0 {
+            output.push_str(
+                "  Inspect: componentctl list; componentctl status <path>; journalctl\r\n\r\n",
+            );
+        }
         output
     }
 }
@@ -164,7 +233,8 @@ fn seconds(ns: u64) -> f64 {
 
 /// Keep metadata inside one ASCII terminal row, including untrusted status text.
 fn clean(text: &str, limit: usize) -> String {
-    text.chars()
+    let mut cleaned: String = text
+        .chars()
         .take(limit)
         .map(|c| {
             if c.is_ascii_graphic() || c == ' ' {
@@ -173,7 +243,12 @@ fn clean(text: &str, limit: usize) -> String {
                 '?'
             }
         })
-        .collect()
+        .collect();
+    if text.chars().count() > limit && limit >= 3 {
+        cleaned.truncate(limit - 3);
+        cleaned.push_str("...");
+    }
+    cleaned
 }
 
 #[cfg(test)]
