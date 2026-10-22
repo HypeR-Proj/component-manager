@@ -140,6 +140,13 @@ fn configuration()
 
 pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut startup = hyper_rt::process::startup()?;
+    if let Some(arguments) = startup.take_boot_command_line()?
+        && !arguments.is_empty()
+    {
+        // The current formal environment defines no boot arguments. Report
+        // leftovers once rather than injecting them into component argv/env.
+        eprintln!("HypeR component-manager: unrecognized boot arguments: {arguments}");
+    }
     let description = startup.take(handoff::DESCRIPTION)?;
     let offer = handoff::Offer::read(description.as_handle_ref())?;
     validate_authority(&offer)?;
