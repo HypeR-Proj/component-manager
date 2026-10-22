@@ -62,10 +62,11 @@ mod tests {
     #[test]
     fn launch_authority_is_checked_before_accepting_ownership() {
         let mut offer = handoff::Offer {
-            version: 3,
+            version: 4,
             root_mount: 1,
             boot_root: "/boot".into(),
             services: Vec::new(),
+            storage_successor: None,
             storage_ready: true,
             slots: [1, 2, 3, 5, 33]
                 .into_iter()
