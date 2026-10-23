@@ -146,6 +146,8 @@ impl Manager {
                             builder
                         }
                     };
+                    phase = "configure scheduling";
+                    super::scheduling::apply(&builder, program.scheduling)?;
                     phase = "attach connector";
                     outgoing = Some(attach_connector(
                         &builder,

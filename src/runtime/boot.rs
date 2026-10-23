@@ -27,7 +27,8 @@ struct Config {
 /// deriving executable capabilities for a child construction transaction.
 fn authority_rights(key: u16) -> Rights {
     match key {
-        3 => Rights::CREATE_PROCESS
+        3 => hyper_os::scheduling::RIGHTS
+            .union(Rights::CREATE_PROCESS)
             .union(Rights::RETAIN_PROCESS)
             .union(Rights::CREATE_TASK_GROUP)
             .union(Rights::LOCK_MEMORY)
@@ -177,6 +178,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         loader.as_handle_ref(),
     )?;
     builder.set_name("system-startup")?;
+    super::scheduling::apply(&builder, program.scheduling)?;
     builder.add_argument(&program.image)?;
     for argument in &program.arguments {
         builder.add_argument(argument)?;

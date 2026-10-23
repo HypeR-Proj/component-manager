@@ -6,6 +6,7 @@ mod display;
 mod launch;
 mod management;
 mod routing;
+mod scheduling;
 mod startup_log;
 
 use crate::lifecycle::Lifecycle;
