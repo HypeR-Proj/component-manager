@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "name": "component-manager",
+  "kind": "service",
+  "origin": {
+    "repository": "https://github.com/roolrz/HypeR",
+    "commit": "8d42d047058a2b58a291803700e86487fb723f7a"
+  },
+  "sources": {
+    "Cargo.toml": "svc/component-manager/Cargo.toml",
+    "component.mk": "svc/component-manager/component.mk",
+    "src/diagnostics.rs": "svc/component-manager/src/diagnostics.rs",
+    "src/lib.rs": "svc/component-manager/src/lib.rs",
+    "src/lifecycle.rs": "svc/component-manager/src/lifecycle.rs",
+    "src/main.rs": "svc/component-manager/src/main.rs",
+    "src/runtime/boot.rs": "svc/component-manager/src/runtime/boot.rs",
+    "src/runtime/display.rs": "svc/component-manager/src/runtime/display.rs",
+    "src/runtime/display/render.rs": "svc/component-manager/src/runtime/display/render.rs",
+    "src/runtime/launch.rs": "svc/component-manager/src/runtime/launch.rs",
+    "src/runtime/management.rs": "svc/component-manager/src/runtime/management.rs",
+    "src/runtime/mod.rs": "svc/component-manager/src/runtime/mod.rs",
+    "src/runtime/routing.rs": "svc/component-manager/src/runtime/routing.rs",
+    "src/runtime/scheduling.rs": "svc/component-manager/src/runtime/scheduling.rs",
+    "src/runtime/startup_log.rs": "svc/component-manager/src/runtime/startup_log.rs",
+    "tests/diagnostics/queue.rs": "svc/component-manager/tests/diagnostics/queue.rs",
+    "tests/display/render.rs": "svc/component-manager/tests/display/render.rs",
+    "tests/lifecycle.rs": "svc/component-manager/tests/lifecycle.rs"
+  },
+  "SPDX-FileCopyrightText": "2026 roolrz",
+  "SPDX-License-Identifier": "Apache-2.0",
+  "mounts": {
+    "": "svc/component-manager"
+  },
+  "packages": [
+    "hyper-component-manager"
+  ],
+  "tests": [
+    [
+      "make",
+      "app-test",
+      "APP_TEST_PACKAGE=hyper-component-manager"
+    ]
+  ]
+}
