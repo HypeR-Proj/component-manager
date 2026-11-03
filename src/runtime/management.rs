@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::command::AppliedCommand;
 use hyper_component::{Reply, Request};
 
 impl Manager {
@@ -28,7 +29,7 @@ impl Manager {
                 .name("component-management".into())
                 .spawn(move || {
                     loop {
-                        let call = match hyper_service_ipc::receive::<Request>(
+                        let mut call = match hyper_service_ipc::receive::<Request>(
                             &listener,
                             hyper_os::DEADLINE_INFINITE,
                         ) {
@@ -41,7 +42,6 @@ impl Manager {
                             }
                         };
                         let mut error = None;
-                        let mut committed = None;
                         if !matches!(
                             call.request,
                             Request::Status { .. } | Request::Routes { .. }
@@ -49,38 +49,24 @@ impl Manager {
                             if readonly {
                                 error = Some("read-only component endpoint".into());
                             } else {
-                                let (reply, response) = mpsc::sync_channel(1);
-                                if send
-                                    .try_send(Event::Command {
-                                        request: call.request.clone(),
-                                        reply,
-                                    })
-                                    .is_err()
-                                {
-                                    error = Some("management queue full".into());
-                                } else {
-                                    let _ = wake.as_byte_channel().try_send(&[1]);
-                                    error = match response
-                                        .recv_timeout(std::time::Duration::from_secs(4))
-                                    {
-                                        Ok(receipt) => {
-                                            committed = Some(receipt.snapshot);
-                                            receipt.result.err()
-                                        }
-                                        Err(_) => Some(
-                                            "operation pending; inspect state before retrying"
-                                                .into(),
-                                        ),
-                                    };
+                                match send.try_send(Event::Command(call)) {
+                                    Ok(()) => {
+                                        let _ = wake.as_byte_channel().try_send(&[1]);
+                                        continue;
+                                    }
+                                    Err(mpsc::TrySendError::Full(Event::Command(returned))) => {
+                                        call = returned;
+                                        error = Some(
+                                            "management queue full; command not accepted".into(),
+                                        );
+                                    }
+                                    Err(_) => return,
                                 }
                             }
                         }
-                        let snapshot = match committed {
-                            Some(snapshot) => snapshot,
-                            None => match snapshot.lock() {
-                                Ok(snapshot) => snapshot.clone(),
-                                Err(_) => return,
-                            },
+                        let snapshot = match snapshot.lock() {
+                            Ok(snapshot) => snapshot.clone(),
+                            Err(_) => return,
                         };
                         let mut response = Reply {
                             error,
@@ -124,4 +110,23 @@ impl Manager {
         }
         Ok((observe.into_handle(), control.into_handle()))
     }
+}
+
+/// Replies are bounded independently of the lifecycle reactor. Dropping an
+/// undeliverable receipt never drops the manager's Process or retirement owners.
+pub(super) fn reply_worker() -> Result<mpsc::SyncSender<AppliedCommand>> {
+    let (send, receive) = mpsc::sync_channel::<AppliedCommand>(8);
+    std::thread::Builder::new()
+        .name("component-command-reply".into())
+        .spawn(move || {
+            for AppliedCommand { call, receipt } in receive {
+                let _ = call.respond(&Reply {
+                    error: receipt.result.err(),
+                    snapshot: receipt.snapshot,
+                    routes: Vec::new(),
+                });
+            }
+        })
+        .map_err(|_| Error::Status(hyper_os::Status::NO_MEMORY))?;
+    Ok(send)
 }

@@ -44,3 +44,12 @@ state before retrying, especially for restart.
 Startup progress is a set of at most sixteen named facts. Repeating an existing
 fact succeeds without changing the revision, including when the set is full;
 only a new fact consumes capacity.
+
+The lifecycle queue retains the original RPC and its absolute deadline. The
+state owner discards calls whose deadline or reply-peer closure is observed
+before accepting intent. Accepted commands remain applied after disconnect;
+query the component path, revision and generation before considering a retry.
+Restart must not be retried automatically. Replies use a separate worker with
+eight queued receipts and finite send budgets; queue overflow loses the reply,
+not lifecycle or retirement ownership. Status exposes the latest state, not an
+unbounded per-request history.
