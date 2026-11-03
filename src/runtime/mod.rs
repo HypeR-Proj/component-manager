@@ -9,7 +9,7 @@ mod routing;
 mod scheduling;
 mod startup_log;
 
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{CommandReceipt, Lifecycle};
 use hyper_component::{Snapshot, State, connection, installation, objects::Object};
 use hyper_os::{
     Error, Result, capability_channel::CapabilityChannel, handle::*, task::ProcessPhase,
@@ -36,7 +36,7 @@ pub(super) enum Event {
     },
     Command {
         request: hyper_component::Request,
-        reply: mpsc::SyncSender<std::result::Result<(), String>>,
+        reply: mpsc::SyncSender<CommandReceipt>,
     },
 }
 
@@ -193,8 +193,12 @@ impl Manager {
             } => self.connection(index, generation, call),
             Event::Install(call) => self.install(call),
             Event::Command { request, reply } => {
-                let result = self.command(request);
-                let _ = reply.try_send(result);
+                let receipt = self.lifecycle.command(request, now()?);
+                // Publish the same state for observers before acknowledging.
+                // The reply retains its own snapshot across later commands.
+                *self.snapshot.lock().map_err(|_| Error::InvalidResponse)? =
+                    receipt.snapshot.clone();
+                let _ = reply.try_send(receipt);
             }
             Event::Started {
                 index,

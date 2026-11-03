@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 
-use hyper_component::{ComponentStatus, Snapshot, State};
+use hyper_component::{ComponentStatus, Request, Snapshot, State};
 use hyper_component_config::{CapabilityType, Restart, Startup, Topology, Transfer};
 
 struct Execution {
@@ -21,6 +21,13 @@ pub struct Lifecycle {
     executions: Vec<Execution>,
     revision: u64,
     progress: Vec<String>,
+}
+
+/// The state owner's acknowledgment, captured before another event can run.
+/// Success applies lifecycle intent; it does not certify process retirement.
+pub struct CommandReceipt {
+    pub result: Result<(), String>,
+    pub snapshot: Snapshot,
 }
 
 impl Lifecycle {
@@ -68,6 +75,39 @@ impl Lifecycle {
             progress: self.progress.clone(),
         }
     }
+
+    pub fn command(&mut self, request: Request, now: u64) -> CommandReceipt {
+        let result = self.apply_command(request, now);
+        CommandReceipt {
+            result,
+            snapshot: self.snapshot(now),
+        }
+    }
+
+    fn apply_command(&mut self, request: Request, now: u64) -> Result<(), String> {
+        let path = match &request {
+            Request::Start { path } | Request::Stop { path } | Request::Restart { path } => path,
+            _ => return Err("not a lifecycle command".into()),
+        };
+        let index = self.topology.index(path).ok_or("unknown component path")?;
+        if self.topology.instances[index].declaration.program.is_none() {
+            return Err("realm has no executable".into());
+        }
+        match request {
+            Request::Start { .. } => self.demand(index).map(|_| ()),
+            Request::Stop { .. } => {
+                if !self.renewable(index) {
+                    return Err(
+                        "stateful component requires its ownership retirement protocol".into(),
+                    );
+                }
+                self.stop(index, now);
+                Ok(())
+            }
+            Request::Restart { .. } => self.restart(index, now),
+            _ => Err("not a lifecycle command".into()),
+        }
+    }
     pub fn is_current(&self, index: usize, generation: u64) -> bool {
         self.executions.get(index).is_some_and(|e| {
             e.status.generation == generation
@@ -111,11 +151,16 @@ impl Lifecycle {
         if e.status.state == State::Failed {
             return Err(format!("component failed: {}", e.status.detail));
         }
-        e.desired = true;
-        e.status
+        let generation = e
+            .status
             .generation
             .checked_add(1)
-            .ok_or_else(|| "execution generation exhausted".into())
+            .ok_or_else(|| "execution generation exhausted".to_string())?;
+        if !e.desired {
+            self.revision = self.revision.saturating_add(1);
+            e.desired = true;
+        }
+        Ok(generation)
     }
 
     /// Select each launch at most once, even when many connections request it.
@@ -336,13 +381,17 @@ impl Lifecycle {
     }
 
     pub fn progress(&mut self, milestone: &str) -> Result<(), String> {
-        if !hyper_component_config::valid_name(milestone) || self.progress.len() >= 16 {
+        if !hyper_component_config::valid_name(milestone) {
             return Err("invalid progress fact".into());
         }
-        if !self.progress.iter().any(|p| p == milestone) {
-            self.progress.push(milestone.into());
-            self.revision = self.revision.saturating_add(1);
+        if self.progress.iter().any(|p| p == milestone) {
+            return Ok(());
         }
+        if self.progress.len() >= 16 {
+            return Err("invalid progress fact".into());
+        }
+        self.progress.push(milestone.into());
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 }
