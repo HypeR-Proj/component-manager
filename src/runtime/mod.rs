@@ -9,7 +9,7 @@ mod routing;
 mod scheduling;
 mod startup_log;
 
-use crate::lifecycle::{CommandReceipt, Lifecycle};
+use crate::lifecycle::Lifecycle;
 use hyper_component::{Snapshot, State, connection, installation, objects::Object};
 use hyper_os::{
     Error, Result, capability_channel::CapabilityChannel, handle::*, task::ProcessPhase,
@@ -34,10 +34,7 @@ pub(super) enum Event {
         outgoing: Option<CapabilityChannel>,
         phase: &'static str,
     },
-    Command {
-        request: hyper_component::Request,
-        reply: mpsc::SyncSender<CommandReceipt>,
-    },
+    Command(hyper_service_ipc::Call<hyper_component::Request>),
 }
 
 #[derive(Default)]
@@ -82,6 +79,7 @@ pub struct Manager {
     wake_reader: OwnedHandle<ByteChannelObject>,
     snapshot: Arc<Mutex<Snapshot>>,
     replies: mpsc::SyncSender<InstallationReply>,
+    command_replies: mpsc::SyncSender<crate::command::AppliedCommand>,
     diagnostic: Option<OwnedHandle<ByteChannelObject>>,
     diagnostics: crate::diagnostics::Diagnostics,
     log_connector: Option<Arc<OwnedHandle<CapabilityChannelObject>>>,
@@ -106,7 +104,9 @@ impl Manager {
                 }
             })
             .map_err(|_| Error::Status(hyper_os::Status::NO_MEMORY))?;
+        let command_replies = management::reply_worker()?;
         Ok(Self {
+            command_replies,
             display: None,
             startup_logs: Vec::new(),
             replies,
@@ -192,13 +192,16 @@ impl Manager {
                 call,
             } => self.connection(index, generation, call),
             Event::Install(call) => self.install(call),
-            Event::Command { request, reply } => {
-                let receipt = self.lifecycle.command(request, now()?);
-                // Publish the same state for observers before acknowledging.
-                // The reply retains its own snapshot across later commands.
+            Event::Command(call) => {
+                let Some(applied) = crate::command::apply_pending(&mut self.lifecycle, call)?
+                else {
+                    return Ok(());
+                };
                 *self.snapshot.lock().map_err(|_| Error::InvalidResponse)? =
-                    receipt.snapshot.clone();
-                let _ = reply.try_send(receipt);
+                    applied.receipt.snapshot.clone();
+                // A lost/full reply cannot roll back applied intent. The state
+                // and real retirement owners remain in this manager.
+                let _ = self.command_replies.try_send(applied);
             }
             Event::Started {
                 index,
