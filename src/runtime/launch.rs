@@ -470,7 +470,7 @@ fn attach_connector(
                     return;
                 };
                 match connection::receive(&listener, until.as_raw()) {
-                    Ok(call) => {
+                    Ok(hyper_service_ipc::Admission::Accepted(call)) => {
                         // Per-instance receivers cannot grow an unbounded queue.
                         // Backpressure parks only this connector's worker.
                         emit(
@@ -484,7 +484,12 @@ fn attach_connector(
                         );
                     }
                     Err(Error::Status(hyper_os::Status::PEER_CLOSED)) => return,
-                    Err(_) => continue,
+                    Ok(hyper_service_ipc::Admission::Rejected(_)) => continue,
+                    Err(Error::Status(hyper_os::Status::TIMED_OUT)) => continue,
+                    Err(error) => {
+                        eprintln!("component connector listener stopped: {error}");
+                        return;
+                    }
                 }
             }
         })

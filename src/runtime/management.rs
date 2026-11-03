@@ -32,9 +32,13 @@ impl Manager {
                             &listener,
                             hyper_os::DEADLINE_INFINITE,
                         ) {
-                            Ok(c) => c,
+                            Ok(hyper_service_ipc::Admission::Accepted(c)) => c,
                             Err(Error::Status(hyper_os::Status::PEER_CLOSED)) => return,
-                            Err(_) => continue,
+                            Ok(hyper_service_ipc::Admission::Rejected(_)) => continue,
+                            Err(error) => {
+                                eprintln!("component management listener stopped: {error}");
+                                return;
+                            }
                         };
                         let mut error = None;
                         if !matches!(

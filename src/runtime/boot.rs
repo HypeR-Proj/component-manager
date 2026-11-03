@@ -348,9 +348,15 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .spawn(move || {
                 loop {
                     match installation::receive(&install_listener) {
-                        Ok(call) => emit(&send, &wake, Event::Install(call)),
+                        Ok(hyper_service_ipc::Admission::Accepted(call)) => {
+                            emit(&send, &wake, Event::Install(call))
+                        }
                         Err(Error::Status(hyper_os::Status::PEER_CLOSED)) => return,
-                        Err(_) => continue,
+                        Ok(hyper_service_ipc::Admission::Rejected(_)) => continue,
+                        Err(error) => {
+                            eprintln!("component installation listener stopped: {error}");
+                            return;
+                        }
                     }
                 }
             })?;
