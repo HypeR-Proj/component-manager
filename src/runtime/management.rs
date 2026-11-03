@@ -41,6 +41,7 @@ impl Manager {
                             }
                         };
                         let mut error = None;
+                        let mut committed = None;
                         if !matches!(
                             call.request,
                             Request::Status { .. } | Request::Routes { .. }
@@ -62,7 +63,10 @@ impl Manager {
                                     error = match response
                                         .recv_timeout(std::time::Duration::from_secs(4))
                                     {
-                                        Ok(result) => result.err(),
+                                        Ok(receipt) => {
+                                            committed = Some(receipt.snapshot);
+                                            receipt.result.err()
+                                        }
                                         Err(_) => Some(
                                             "operation pending; inspect state before retrying"
                                                 .into(),
@@ -71,8 +75,12 @@ impl Manager {
                                 }
                             }
                         }
-                        let Ok(snapshot) = snapshot.lock().map(|s| s.clone()) else {
-                            return;
+                        let snapshot = match committed {
+                            Some(snapshot) => snapshot,
+                            None => match snapshot.lock() {
+                                Ok(snapshot) => snapshot.clone(),
+                                Err(_) => return,
+                            },
                         };
                         let mut response = Reply {
                             error,
@@ -115,39 +123,5 @@ impl Manager {
                 .map_err(|_| Error::Status(hyper_os::Status::NO_MEMORY))?;
         }
         Ok((observe.into_handle(), control.into_handle()))
-    }
-
-    pub(super) fn command(&mut self, request: Request) -> std::result::Result<(), String> {
-        let path = match &request {
-            Request::Start { path } | Request::Stop { path } | Request::Restart { path } => path,
-            _ => return Ok(()),
-        };
-        let index = self
-            .lifecycle
-            .topology
-            .index(path)
-            .ok_or("unknown component path")?;
-        if self.lifecycle.topology.instances[index]
-            .declaration
-            .program
-            .is_none()
-        {
-            return Err("realm has no executable".into());
-        }
-        let time = now().map_err(|e| format!("clock: {e:?}"))?;
-        match request {
-            Request::Start { .. } => self.lifecycle.demand(index).map(|_| ()),
-            Request::Stop { .. } => {
-                if !self.lifecycle.renewable(index) {
-                    return Err(
-                        "stateful component requires its ownership retirement protocol".into(),
-                    );
-                }
-                self.lifecycle.stop(index, time);
-                Ok(())
-            }
-            Request::Restart { .. } => self.lifecycle.restart(index, time),
-            _ => Ok(()),
-        }
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 
-use hyper_component::State;
+use hyper_component::{Request, State};
 use hyper_component_config::Topology;
 use hyper_component_manager::lifecycle::Lifecycle;
 use serde_json::json;
@@ -169,5 +169,96 @@ fn administrative_stop_during_exit_cancels_automatic_restart() -> Result<(), Str
     e.retired(1, 1, false, 3)?;
     assert_eq!(e.status(1).state, State::Stopped);
     assert!(e.begin(10_000_000_000).is_empty());
+    Ok(())
+}
+
+#[test]
+fn repeated_progress_remains_idempotent_at_capacity() -> Result<(), String> {
+    let mut lifecycle = engine(false)?;
+    for index in 0..16 {
+        lifecycle.progress(&format!("fact-{index}"))?;
+    }
+    let full = lifecycle.snapshot(1);
+    lifecycle.progress("fact-0")?;
+    lifecycle.progress("fact-15")?;
+    assert_eq!(lifecycle.snapshot(2).revision, full.revision);
+    assert_eq!(lifecycle.snapshot(2).progress, full.progress);
+    assert!(lifecycle.progress("fact-16").is_err());
+    assert!(lifecycle.progress("invalid/fact").is_err());
+    assert_eq!(lifecycle.snapshot(3).revision, full.revision);
+    Ok(())
+}
+
+#[test]
+fn command_receipts_keep_their_own_state_across_later_events() -> Result<(), String> {
+    let mut lifecycle = engine(false)?;
+    let before = lifecycle.snapshot(0);
+    let started = lifecycle.command(
+        Request::Start {
+            path: "/server".into(),
+        },
+        1,
+    );
+    started.result?;
+    assert!(started.snapshot.revision > before.revision);
+    // Start acknowledges intent; the launch belongs to a later reactor pass.
+    assert_eq!(started.snapshot.components[1].state, State::Stopped);
+    assert_eq!(lifecycle.begin(2), [(1, 1)]);
+    lifecycle.started(1, 1, 42)?;
+    let running = lifecycle.snapshot(3);
+    let stopped = lifecycle.command(
+        Request::Stop {
+            path: "/server".into(),
+        },
+        4,
+    );
+    stopped.result?;
+    assert!(stopped.snapshot.revision > running.revision);
+    assert_eq!(stopped.snapshot.captured_at_ns, 4);
+    assert_eq!(stopped.snapshot.components[1].state, State::Stopping);
+    assert_eq!(stopped.snapshot.components[1].generation, 1);
+    assert_eq!(stopped.snapshot.components[1].process, Some(42));
+    let restarted = lifecycle.command(
+        Request::Restart {
+            path: "/server".into(),
+        },
+        5,
+    );
+    restarted.result?;
+    assert!(restarted.snapshot.revision > stopped.snapshot.revision);
+    lifecycle.retired(1, 1, true, 6)?;
+    assert_eq!(lifecycle.begin(7), [(1, 2)]);
+    lifecycle.started(1, 2, 43)?;
+    assert_eq!(stopped.snapshot.components[1].state, State::Stopping);
+    assert_eq!(stopped.snapshot.components[1].process, Some(42));
+    assert_eq!(restarted.snapshot.components[1].generation, 1);
+    assert_eq!(started.snapshot.components[1].generation, 0);
+    Ok(())
+}
+
+#[test]
+fn rejected_command_receipt_has_the_unchanged_owner_state() -> Result<(), String> {
+    let mut lifecycle = engine(true)?;
+    let before = lifecycle.snapshot(0);
+    for request in [
+        Request::Stop {
+            path: "/missing".into(),
+        },
+        Request::Start { path: "/".into() },
+        Request::Stop {
+            path: "/server".into(),
+        },
+        Request::Restart {
+            path: "/server".into(),
+        },
+        Request::Status { path: None },
+    ] {
+        let receipt = lifecycle.command(request, 10);
+        assert!(receipt.result.is_err());
+        assert_eq!(receipt.snapshot.revision, before.revision);
+        assert_eq!(receipt.snapshot.captured_at_ns, 10);
+        assert_eq!(receipt.snapshot.components[1].state, State::Stopped);
+        assert_eq!(receipt.snapshot.components[1].generation, 0);
+    }
     Ok(())
 }
