@@ -41,6 +41,19 @@ retirement and replacement happen later. Inspect current status to observe those
 transitions. An acknowledgment timeout remains an uncertain outcome: inspect
 state before retrying, especially for restart.
 
+A stop of a running execution issues one user-space `Terminate` request. The
+application may register `Notify` and clean up before exiting, or `Ignore`;
+the initial `Default` disposition requests immediate forced termination.
+Neither notification nor its acknowledgment proves that the Process has exited.
+During cooperative cleanup the manager withdraws the component's provider routes
+but preserves its connection to dependencies. The program's `timeout_ms` bounds
+this grace period; repeated stop requests do not extend the original deadline.
+At that deadline the manager terminates the execution and its owned TaskGroup,
+then waits for retirement. A failed control connection does not silently become
+`Default`: it is diagnosed and the existing stop deadline remains in force.
+Construction cancellation and observed process exit use immediate teardown.
+These are component-manager policies, not terminal Ctrl+C or kernel signal policy.
+
 Startup progress is a set of at most sixteen named facts. Repeating an existing
 fact succeeds without changing the revision, including when the set is full;
 only a new fact consumes capacity.

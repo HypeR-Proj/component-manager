@@ -44,12 +44,70 @@ fn cancellation_during_launch_cannot_resurrect_a_stopped_instance() -> Result<()
     e.demand(1)?;
     e.begin(0);
     e.stop(1, 1);
+    assert!(e.force_required(1));
+    assert!(!e.accepts_connections(1, 1));
     assert!(e.started(1, 1, 42).is_err());
     assert!(e.publish(1, 1, "echo").is_err());
     assert!(e.demand(1).is_err());
     e.retired(1, 1, true, 2)?;
     assert!(e.begin(3).is_empty());
     assert_eq!(e.demand(1)?, 2);
+    Ok(())
+}
+
+#[test]
+fn graceful_stop_keeps_cleanup_routes_until_the_original_deadline() -> Result<(), String> {
+    let mut e = engine(false)?;
+    e.topology.instances[1]
+        .declaration
+        .program
+        .as_mut()
+        .ok_or("program")?
+        .timeout_ms = 10;
+    e.demand(1)?;
+    e.begin(0);
+    e.started(1, 1, 42)?;
+    e.publish(1, 1, "echo")?;
+    e.stop(1, 5);
+    assert_eq!(e.status(1).state, State::Stopping);
+    assert!(e.status(1).published.is_empty());
+    assert!(e.accepts_connections(1, 1));
+    assert!(!e.accepts_connections(1, 2));
+    e.detail(1, 1, "cleanup in progress")?;
+    assert!(e.detail(1, 2, "stale cleanup").is_err());
+    assert!(e.publish(1, 1, "echo").is_err());
+    assert!(!e.force_required(1));
+    assert!(!e.stop_expired(1, 10_000_004));
+    e.stop(1, 9_000_000);
+    assert!(e.stop_expired(1, 10_000_005));
+    // A delayed action for another generation cannot revoke cleanup routes.
+    e.force_stop(1, 2);
+    assert!(e.accepts_connections(1, 1));
+    e.force_stop(1, 1);
+    assert!(e.force_required(1));
+    assert!(!e.accepts_connections(1, 1));
+    assert!(e.detail(1, 1, "cleanup after forced stop").is_err());
+    assert!(e.begin(20_000_000).is_empty());
+    e.retired(1, 1, true, 20_000_001)?;
+    assert_eq!(e.status(1).state, State::Stopped);
+    Ok(())
+}
+
+#[test]
+fn natural_exit_during_grace_revokes_cleanup_routes_before_retirement() -> Result<(), String> {
+    let mut e = engine(false)?;
+    e.demand(1)?;
+    e.begin(0);
+    e.started(1, 1, 42)?;
+    e.stop(1, 1);
+    assert!(e.accepts_connections(1, 1));
+    e.exiting(1, 1);
+    assert!(e.force_required(1));
+    assert!(!e.accepts_connections(1, 1));
+    e.stop(1, 2);
+    assert!(e.force_required(1));
+    e.retired(1, 1, true, 3)?;
+    assert_eq!(e.status(1).state, State::Stopped);
     Ok(())
 }
 
@@ -88,6 +146,8 @@ fn prepared_authority_is_never_recreated_after_failure_or_stop() -> Result<(), S
     e.demand(1)?;
     e.begin(0);
     e.fail(1, 1, "loader failed", 1);
+    assert!(e.force_required(1));
+    assert!(!e.accepts_connections(1, 1));
     e.retired(1, 1, false, 2)?;
     assert!(e.demand(1).is_err());
     assert!(e.restart(1, 3).is_err());
@@ -119,6 +179,7 @@ fn framework_startup_purposes_do_not_alias_journal_or_retirement() {
         hyper_journal::QUERY.as_raw(),
         hyper_journal::MIRROR.as_raw(),
         hyper_bootstrap_handoff::retirement::ENDPOINT.as_raw(),
+        hyper_service::process::control::STARTUP.as_raw(),
     ];
     let distinct: std::collections::BTreeSet<_> = purposes.into_iter().collect();
     assert_eq!(distinct.len(), purposes.len());

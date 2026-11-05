@@ -17,6 +17,8 @@ impl Manager {
             .program
             .clone()
             .ok_or(Error::InvalidResponse)?;
+        let (control, child_control) = hyper_service::process::control::prepare()?;
+        self.running[index].control = ProcessControl::Active(control);
         let (prepared, group, worker_group) = if program.prepared {
             let Prepared {
                 builder,
@@ -148,6 +150,14 @@ impl Manager {
                     };
                     phase = "configure scheduling";
                     super::scheduling::apply(&builder, program.scheduling)?;
+                    phase = "attach process control";
+                    builder
+                        .add_handle_move(
+                            child_control,
+                            hyper_service::process::control::STARTUP.as_raw(),
+                            RightsOffer::Exact(hyper_service::process::control::CHILD_RIGHTS),
+                        )
+                        .map_err(|failure| failure.error())?;
                     phase = "attach connector";
                     outgoing = Some(attach_connector(
                         &builder,
