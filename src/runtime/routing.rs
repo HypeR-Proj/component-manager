@@ -20,7 +20,7 @@ pub(super) struct Pending {
 impl Manager {
     pub(super) fn connection(&mut self, index: usize, generation: u64, call: connection::Call) {
         let result = (|| {
-            if !self.lifecycle.is_current(index, generation) {
+            if !self.lifecycle.accepts_connections(index, generation) {
                 return Err(Rejection::new(
                     RejectionKind::Unavailable,
                     "caller execution is no longer active",
@@ -132,7 +132,7 @@ impl Manager {
                 ))
             } else if !self
                 .lifecycle
-                .is_current(pending.consumer, pending.consumer_generation)
+                .accepts_connections(pending.consumer, pending.consumer_generation)
             {
                 Some(Rejection::new(
                     RejectionKind::Unavailable,

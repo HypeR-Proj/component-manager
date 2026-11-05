@@ -14,6 +14,7 @@ use hyper_component::{Snapshot, State, connection, installation, objects::Object
 use hyper_os::{
     Error, Result, capability_channel::CapabilityChannel, handle::*, task::ProcessPhase,
 };
+use hyper_service::process::control::{Dispatch, Supervisor};
 use std::sync::{Arc, Mutex, mpsc};
 
 pub(super) const MAX_EVENTS: usize = 32;
@@ -38,6 +39,14 @@ pub(super) enum Event {
 }
 
 #[derive(Default)]
+enum ProcessControl {
+    #[default]
+    Legacy,
+    Active(Supervisor),
+    Unavailable,
+}
+
+#[derive(Default)]
 pub(super) struct Running {
     process: Option<OwnedHandle<ProcessObject>>,
     retirement: Option<hyper_os::task::ProcessRetirement>,
@@ -47,6 +56,8 @@ pub(super) struct Running {
     outgoing: Option<CapabilityChannel>,
     install_reply: Option<(CapabilityChannel, u64)>,
     termination_reported: bool,
+    control: ProcessControl,
+    terminate_requested: bool,
 }
 
 pub struct Authority {
@@ -273,6 +284,7 @@ impl Manager {
                 self.lifecycle
                     .fail(i, generation, "startup deadline exceeded", now()?);
             }
+            self.poll_control(i, generation, now()?);
             let info = self.running[i]
                 .process
                 .as_ref()
@@ -328,7 +340,7 @@ impl Manager {
             }
             let instance = &mut self.running[i];
             let state = self.lifecycle.status(i).state;
-            if state == State::Stopping || terminal {
+            if self.lifecycle.force_required(i) || terminal {
                 instance
                     .canceled
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -369,6 +381,48 @@ impl Manager {
         Ok(())
     }
 
+    fn poll_control(&mut self, index: usize, generation: u64, time: u64) {
+        let stopping = self.lifecycle.status(index).state == State::Stopping;
+        if self.lifecycle.stop_expired(index, time) {
+            self.report(index, "graceful stop deadline exceeded; terminating", true);
+            self.lifecycle.force_stop(index, generation);
+        }
+        let instance = &mut self.running[index];
+        if stopping && !self.lifecycle.force_required(index) && !instance.terminate_requested {
+            instance.terminate_requested = true;
+            match &mut instance.control {
+                ProcessControl::Active(control) => control.request_terminate(),
+                ProcessControl::Legacy => {
+                    // Adopted bootstrap executions have no control connection.
+                    self.lifecycle.force_stop(index, generation);
+                }
+                ProcessControl::Unavailable => {}
+            }
+        }
+        let dispatch = match &mut instance.control {
+            ProcessControl::Active(control) => Some(control.poll(time)),
+            _ => None,
+        };
+        match dispatch {
+            Some(Ok(Some(Dispatch::Default))) if stopping => {
+                self.lifecycle.force_stop(index, generation);
+            }
+            Some(Ok(Some(Dispatch::Unavailable))) => {
+                instance.control = ProcessControl::Unavailable;
+                self.report(
+                    index,
+                    "process control unavailable; retaining stop deadline",
+                    true,
+                );
+            }
+            Some(Err(error)) => {
+                instance.control = ProcessControl::Unavailable;
+                self.report(index, &format!("process control failed: {error:?}"), true);
+            }
+            _ => {}
+        }
+    }
+
     fn wait(&self) -> Result<()> {
         use hyper_os::wait::*;
         let mut items = vec![WaitItem::new(
@@ -388,6 +442,12 @@ impl Manager {
                     p.as_handle_ref(),
                     ObjectSignals::<ProcessObject>::TERMINATED,
                 ));
+            }
+            if items.len() < hyper_os::wait::MAX_ITEMS
+                && let ProcessControl::Active(control) = &instance.control
+                && let Some(item) = control.wait_item()
+            {
+                items.push(item);
             }
         }
         let until = hyper_os::time::deadline_after(std::time::Duration::from_millis(

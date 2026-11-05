@@ -156,6 +156,14 @@ lifetimes. See [Native terminals](https://hyper-proj.github.io/terminal-service/
   substitute for teardown. An observed Process exit immediately withdraws its
   published routes and enters `stopping` while descendants retire. A subsequent
   stop cancels an outstanding restart.
+- The manager issues one cooperative `Terminate` request for a running component
+  when stopped.
+  `Default` terminates immediately; `Notify` lets the application clean up and
+  exit, while `Ignore` leaves it running until the manager's stop deadline.
+  The first stop fixes that deadline using `timeout_ms`; retries cannot postpone
+  it. A draining component can still connect to its dependencies, but cannot
+  republish withdrawn provider routes. Expiry forces group teardown and does not
+  certify retirement or authorize an early replacement.
 - `resident` permits the application to use memory locking; it does not pin the
   application automatically. Critical migration participants explicitly lock
   their current mappings before the relevant ownership rendezvous.

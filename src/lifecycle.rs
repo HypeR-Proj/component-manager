@@ -4,6 +4,13 @@
 use hyper_component::{ComponentStatus, Request, Snapshot, State};
 use hyper_component_config::{CapabilityType, Restart, Startup, Topology, Transfer};
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StopPhase {
+    None,
+    Graceful,
+    Forced,
+}
+
 struct Execution {
     status: ComponentStatus,
     deadline: u64,
@@ -11,6 +18,7 @@ struct Execution {
     restart_requested: bool,
     consumed: bool,
     failed: bool,
+    stop_phase: StopPhase,
 }
 
 /// One owner arbitrates start/stop/exit. A run remains Stopping until its process,
@@ -54,6 +62,7 @@ impl Lifecycle {
                 restart_requested: false,
                 consumed: false,
                 failed: false,
+                stop_phase: StopPhase::None,
             })
             .collect();
         Self {
@@ -113,6 +122,36 @@ impl Lifecycle {
             e.status.generation == generation
                 && matches!(e.status.state, State::Starting | State::Running)
         })
+    }
+
+    /// A draining consumer may still connect to dependencies for cleanup.
+    /// This does not allow it to publish new provider routes or restart itself.
+    pub fn accepts_connections(&self, index: usize, generation: u64) -> bool {
+        self.executions.get(index).is_some_and(|e| {
+            e.status.generation == generation
+                && (matches!(e.status.state, State::Starting | State::Running)
+                    || (e.status.state == State::Stopping && e.stop_phase == StopPhase::Graceful))
+        })
+    }
+
+    pub fn stop_expired(&self, index: usize, now: u64) -> bool {
+        let e = &self.executions[index];
+        e.status.state == State::Stopping
+            && e.stop_phase == StopPhase::Graceful
+            && now >= e.deadline
+    }
+
+    pub fn force_required(&self, index: usize) -> bool {
+        let e = &self.executions[index];
+        e.status.state == State::Stopping && e.stop_phase == StopPhase::Forced
+    }
+
+    /// Commit the end of the grace period before revoking runtime resources.
+    pub fn force_stop(&mut self, index: usize, generation: u64) {
+        let e = &mut self.executions[index];
+        if e.status.generation == generation && e.status.state == State::Stopping {
+            e.stop_phase = StopPhase::Forced;
+        }
     }
     pub fn renewable(&self, index: usize) -> bool {
         !self.executions[index].consumed
@@ -197,6 +236,7 @@ impl Lifecycle {
             e.status.detail = "starting".into();
             e.deadline = now.saturating_add(program.timeout_ms * 1_000_000);
             e.failed = false;
+            e.stop_phase = StopPhase::None;
             e.consumed = program.prepared
                 || self
                     .topology
@@ -251,6 +291,16 @@ impl Lifecycle {
         e.desired = false;
         e.restart_requested = false;
         e.status.published.clear();
+        // Repeated administrative requests must not extend a run's grace period.
+        // Construction cancellation cannot rely on an application handler yet.
+        if e.status.state != State::Stopping {
+            e.stop_phase = match e.status.state {
+                State::Running => StopPhase::Graceful,
+                State::Starting => StopPhase::Forced,
+                _ => StopPhase::None,
+            };
+            e.deadline = now.saturating_add(timeout.saturating_mul(1_000_000));
+        }
         e.status.state = if matches!(
             e.status.state,
             State::Starting | State::Running | State::Stopping
@@ -259,7 +309,6 @@ impl Lifecycle {
         } else {
             State::Stopped
         };
-        e.deadline = now.saturating_add(timeout * 1_000_000);
         e.status.detail = "stop requested".into();
         self.revision = self.revision.saturating_add(1);
     }
@@ -286,6 +335,7 @@ impl Lifecycle {
         self.stop(index, now);
         let e = &mut self.executions[index];
         e.failed = true;
+        e.stop_phase = StopPhase::Forced;
         e.desired = true;
         e.status.detail = message.chars().take(256).collect();
     }
@@ -354,18 +404,19 @@ impl Lifecycle {
     /// Keep the desired state and retry budget until the adapter joins every
     /// descendant; a natural exit is not an administrative stop request.
     pub fn exiting(&mut self, index: usize, generation: u64) {
-        if !self.is_current(index, generation) {
+        if !self.accepts_connections(index, generation) {
             return;
         }
         let e = &mut self.executions[index];
         e.status.state = State::Stopping;
+        e.stop_phase = StopPhase::Forced;
         e.status.published.clear();
         e.status.detail = "process exited; waiting for descendants to retire".into();
         self.revision = self.revision.saturating_add(1);
     }
 
     pub fn detail(&mut self, index: usize, generation: u64, message: &str) -> Result<(), String> {
-        if !self.is_current(index, generation) {
+        if !self.accepts_connections(index, generation) {
             return Err("stale status update".into());
         }
         self.executions[index].status.detail = message.chars().take(256).collect();
