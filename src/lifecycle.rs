@@ -416,10 +416,34 @@ impl Lifecycle {
     }
 
     pub fn detail(&mut self, index: usize, generation: u64, message: &str) -> Result<(), String> {
+        self.update_detail(index, generation, message, 256)
+    }
+
+    /// Retain the whole bounded critical report, including its original cause.
+    pub fn critical_detail(
+        &mut self,
+        index: usize,
+        generation: u64,
+        message: &str,
+    ) -> Result<(), String> {
+        let limit = hyper_component::connection::MAX_MESSAGE;
+        if message.len() > limit {
+            return Err("critical report exceeds wire limit".into());
+        }
+        self.update_detail(index, generation, message, limit)
+    }
+
+    fn update_detail(
+        &mut self,
+        index: usize,
+        generation: u64,
+        message: &str,
+        limit: usize,
+    ) -> Result<(), String> {
         if !self.accepts_connections(index, generation) {
             return Err("stale status update".into());
         }
-        self.executions[index].status.detail = message.chars().take(256).collect();
+        self.executions[index].status.detail = message.chars().take(limit).collect();
         self.revision = self.revision.saturating_add(1);
         Ok(())
     }

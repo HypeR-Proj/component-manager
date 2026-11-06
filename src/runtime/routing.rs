@@ -38,6 +38,17 @@ impl Manager {
                         self.report(index, &format!("worker failure: {message}"), true);
                     })
                 }
+                connection::Request::ReportCriticalFailure { message } => self
+                    .lifecycle
+                    .critical_detail(index, generation, message)
+                    .map(|()| {
+                        self.report_severity(
+                            index,
+                            &format!("critical subsystem failure: {message}"),
+                            true,
+                            true,
+                        );
+                    }),
                 connection::Request::Connect { .. } => return Ok(false),
             }
             .map_err(|message| Rejection::new(RejectionKind::InvalidRequest, message))?;

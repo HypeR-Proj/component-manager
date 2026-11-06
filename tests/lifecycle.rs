@@ -21,6 +21,23 @@ fn engine(prepared: bool) -> Result<Lifecycle, String> {
 }
 
 #[test]
+fn critical_detail_retains_cause_within_wire_bound_and_generation() -> Result<(), String> {
+    let mut lifecycle = engine(false)?;
+    lifecycle.demand(1)?;
+    lifecycle.begin(0);
+    lifecycle.started(1, 1, 42)?;
+    let report = format!("{} original provider fault", "x".repeat(768));
+    lifecycle.critical_detail(1, 1, &report)?;
+    assert_eq!(lifecycle.status(1).detail, report);
+    assert!(lifecycle.critical_detail(1, 2, "stale").is_err());
+    assert!(lifecycle.critical_detail(1, 1, &"x".repeat(1025)).is_err());
+    assert_eq!(lifecycle.status(1).detail, report);
+    lifecycle.detail(1, 1, &report)?;
+    assert_eq!(lifecycle.status(1).detail.len(), 256);
+    Ok(())
+}
+
+#[test]
 fn concurrent_demands_share_one_launch_generation() -> Result<(), String> {
     let mut e = engine(false)?;
     for _ in 0..128 {
