@@ -473,8 +473,12 @@ impl Manager {
     }
 
     fn report(&mut self, index: usize, message: &str, failure: bool) {
+        self.report_severity(index, message, failure, false);
+    }
+
+    fn report_severity(&mut self, index: usize, message: &str, failure: bool, critical: bool) {
         let status = self.lifecycle.status(index);
-        let critical = self.critical(index);
+        let critical = critical || self.critical(index);
         let severity = if critical {
             "CRITICAL"
         } else if failure {
